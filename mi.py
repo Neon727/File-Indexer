@@ -14,13 +14,14 @@ PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 
 CREATE TABLE IF NOT EXISTS files (
-  id    INTEGER PRIMARY KEY,
-  path  TEXT NOT NULL UNIQUE,
-  name  TEXT NOT NULL,
-  ext   TEXT,
-  dir   TEXT NOT NULL,
-  size  INTEGER,
-  mtime INTEGER
+  id       INTEGER PRIMARY KEY,
+  path     TEXT NOT NULL UNIQUE,
+  name     TEXT NOT NULL,
+  ext      TEXT,
+  dir      TEXT NOT NULL,
+  size     INTEGER,
+  mtime    INTEGER,
+  scan_gen INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_ext ON files(ext);
 
@@ -35,10 +36,14 @@ def connect():
     DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB)
     conn.executescript(SCHEMA)
+    # migrate pre-scan_gen DBs in place
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(files)")}
+    if "scan_gen" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN scan_gen INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
     return conn
 
 def scan(root):
-    """Yield (path, name, ext, dir, size, mtime) for every file under root."""
     root = os.path.abspath(root)
     for dirpath, _dirnames, filenames in os.walk(root, onerror=lambda e: None):
         for fn in filenames:
@@ -50,43 +55,80 @@ def scan(root):
             ext = os.path.splitext(fn)[1].lower().lstrip(".")
             yield p, fn, ext, dirpath, st.st_size, int(st.st_mtime)
 
-def upsert(conn, row):
+def upsert(conn, row, gen):
     cur = conn.execute(
-        """INSERT INTO files(path,name,ext,dir,size,mtime) VALUES(?,?,?,?,?,?)
+        """INSERT INTO files(path,name,ext,dir,size,mtime,scan_gen)
+           VALUES(?,?,?,?,?,?,?)
            ON CONFLICT(path) DO UPDATE SET
              name=excluded.name, ext=excluded.ext, dir=excluded.dir,
-             size=excluded.size, mtime=excluded.mtime
+             size=excluded.size, mtime=excluded.mtime, scan_gen=excluded.scan_gen
            RETURNING id""",
-        row,
+        (*row, gen),
     )
     fid = cur.fetchone()[0]
     conn.execute("DELETE FROM files_fts WHERE rowid=?", (fid,))
     conn.execute("INSERT INTO files_fts(rowid,name,path) VALUES(?,?,?)",
                  (fid, row[1], row[0]))
 
+def root_prefix(root):
+    return os.path.abspath(root).rstrip(os.sep) + os.sep + "%"
+
+def bump_gen(conn, root):
+    key = "gen:" + os.path.abspath(root)
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    gen = (int(row[0]) if row else 0) + 1
+    conn.execute("INSERT OR REPLACE INTO meta VALUES(?, ?)", (key, str(gen)))
+    return gen
+
+def prune(conn, root, gen):
+    prefix = root_prefix(root)
+    stale = conn.execute(
+        "SELECT COUNT(*) FROM files WHERE path LIKE ? AND scan_gen < ?",
+        (prefix, gen),
+    ).fetchone()[0]
+    if not stale:
+        return 0
+    conn.execute(
+        "DELETE FROM files_fts WHERE rowid IN "
+        "(SELECT id FROM files WHERE path LIKE ? AND scan_gen < ?)",
+        (prefix, gen),
+    )
+    conn.execute(
+        "DELETE FROM files WHERE path LIKE ? AND scan_gen < ?",
+        (prefix, gen),
+    )
+    return stale
+
 def cmd_index(args):
     conn = connect()
-    n, t0 = 0, time.time()
-    with conn:  # one big transaction = big speed win
+    total_n, total_pruned, t0 = 0, 0, time.time()
+    with conn:
         for root in args.paths:
             if not os.path.exists(root):
                 print(f"skip (not found): {root}", file=sys.stderr)
                 continue
+            gen = bump_gen(conn, root)
+            n = 0
             for row in scan(root):
-                upsert(conn, row)
+                upsert(conn, row, gen)
                 n += 1
                 if n % 2000 == 0:
-                    print(f"\r  {n:,} files...", end="", file=sys.stderr)
+                    print(f"\r  {root}: {n:,} files...", end="", file=sys.stderr)
+            total_n += n
+            if not args.no_prune:
+                total_pruned += prune(conn, root, gen)
         conn.execute("INSERT OR REPLACE INTO meta VALUES('last_index', ?)",
                      (str(int(time.time())),))
-    print(f"\rIndexed {n:,} files in {time.time()-t0:.1f}s", file=sys.stderr)
+    print(f"\rIndexed {total_n:,} files"
+          + (f", pruned {total_pruned:,} stale" if total_pruned else "")
+          + f" in {time.time()-t0:.1f}s", file=sys.stderr)
 
 def cmd_search(args):
     conn = connect()
     terms = args.query.replace('"', " ").split()
     if not terms:
         return
-    fts_q = " ".join(t + "*" for t in terms)  # prefix match per term
+    fts_q = " ".join(t + "*" for t in terms)
     sql = """
       SELECT f.path, f.size, f.mtime
       FROM files_fts s JOIN files f ON f.id = s.rowid
@@ -97,7 +139,6 @@ def cmd_search(args):
     try:
         rows = conn.execute(sql, (fts_q, args.limit)).fetchall()
     except sqlite3.OperationalError:
-        # fallback for queries FTS chokes on
         like = "%" + "%".join(terms) + "%"
         rows = conn.execute(
             "SELECT path,size,mtime FROM files WHERE name LIKE ? ORDER BY mtime DESC LIMIT ?",
@@ -126,6 +167,8 @@ def main():
 
     pi = sub.add_parser("index", help="scan and index folders")
     pi.add_argument("paths", nargs="+")
+    pi.add_argument("--no-prune", action="store_true",
+                    help="don't delete stale entries under scanned roots")
     pi.set_defaults(func=cmd_index)
 
     ps = sub.add_parser("search", help="search the index")
